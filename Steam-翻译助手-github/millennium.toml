@@ -1,0 +1,33 @@
+[plugin]
+id = "steamtranslator"
+name = "Steam 翻译助手"
+version = "1.0.0"
+author = "garaf"
+description = "翻译 Steam 商店、社区、创意工坊、游戏库与聊天页面；默认 DeepSeek，可换任意 OpenAI 兼容模型；输入框支持一键翻译。"
+
+[assets]
+resources = ["resources/**/*"]
+
+[backend]
+entry = "backend/main.lua"
+sources = ["backend/**/*.lua"]
+
+
+[frontend]
+entry = "frontend/library.tsx"
+
+[webkit]
+entry = "webview/preload.ts"
+
+[compiler]
+output_path = "Steam-翻译助手.star"
+
+[dev]
+auto_restart = true
+reload_steamui_when = "both"
+
+[logger]
+padding = 0
+backend_prefix  = "BCK"
+frontend_prefix = "FRT"
+webview_prefix  = "WEB"
