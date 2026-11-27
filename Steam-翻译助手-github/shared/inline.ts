@@ -1,3 +1,5 @@
+import { privateFields } from './policy';
+
 /**
  * 输入框一键翻译控件（语言下拉 + 译）。
  * 独立于菜单样式，自己注入 <style>，可挂到任意 document（包括 Steam 的聊天窗口）。
@@ -52,7 +54,7 @@ function injectStyle(doc: Document) {
   (doc.head || doc.documentElement).appendChild(style);
 }
 
-export function installInline(doc: Document, onNotice?: (msg: string) => void) {
+export function installInline(doc: Document, onNotice?: (msg: string) => void, signal?: AbortSignal) {
   const win = doc.defaultView;
   if (!win || !doc.body) return;
   // 同一个 document 只装一次：Steam 会重建 body，只靠 body 上的标记会重复安装
@@ -67,8 +69,6 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
   let btn: HTMLButtonElement | null = null;
   let sel: HTMLSelectElement | null = null;
   let target: HTMLElement | null = null;
-  let lastText = '';
-  const recent: HTMLElement[] = [];
   let hideTimer: number | undefined;
   let toast: HTMLDivElement | null = null;
 
@@ -92,7 +92,7 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
 
   async function refreshLang() {
     try {
-      const raw: unknown = await backend.getConfig();
+      const raw: unknown = await (backend as any).getPublicConfig();
       const cfg = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { targetLang?: string };
       if (cfg?.targetLang) {
         targetLang = cfg.targetLang;
@@ -113,7 +113,7 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
     if (!el || el.nodeType !== 1 || !el.closest) return null;
     const found = el.closest(EDITABLE_SELECTOR) as HTMLElement | null;
     if (!found) return null;
-    if (found.closest('#ds-tr-panel')) return null;
+    if (found.closest(privateFields)) return null;
     if (found.tagName === 'INPUT') {
       const type = ((found as HTMLInputElement).type || 'text').toLowerCase();
       if (!['text', 'search', 'url', 'email'].includes(type)) return null;
@@ -123,7 +123,7 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
 
   function readEditable(el: HTMLElement): string {
     if (isField(el)) {
-      return el.value || el.defaultValue || el.textContent || '';
+      return el.value;
     }
     return el.innerText || '';
   }
@@ -194,57 +194,37 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
   }
 
   async function translateCurrent() {
-    if (!btn) return;
-    // Steam 可能重建聊天框节点，target 会变成已脱离文档的旧节点；
-    // 点击时重新解析：当前焦点 → 最近的输入框 → 页面上第一个有内容的输入框
-    let el: HTMLElement | null = target && target.isConnected ? target : null;
-    if (!el) {
-      const active = doc.activeElement as HTMLElement | null;
-      el = (active && editableOf(active)) || null;
-    }
-    if (!el) el = recent.filter(n => n.isConnected).pop() || null;
-    let text = el ? readEditable(el).trim() : '';
+    const button = btn;
+    if (!button) return;
+    const el = editableOf(target?.isConnected ? target : doc.activeElement);
+    if (!el) { showToast('请重新选择要翻译的输入框'); return; }
+    const draft = readEditable(el);
+    const text = draft.trim();
     if (!text) {
-      for (const cand of Array.from(doc.querySelectorAll(EDITABLE_SELECTOR))) {
-        const value = readEditable(cand as HTMLElement).trim();
-        if (value) { el = cand as HTMLElement; text = value; break; }
-      }
-    }
-    if (!text) text = lastText.trim();
-    notice('inline click el=' + (el ? el.tagName + '.' + String((el as HTMLElement).className || '') : 'null') + ' len=' + text.length);
-    if (!text) {
-      try {
-        const list = Array.from(doc.querySelectorAll(EDITABLE_SELECTOR)) as HTMLElement[];
-        const active = doc.activeElement as HTMLElement | null;
-        notice('inline dump title=' + JSON.stringify(doc.title || '') +
-          ' active=' + (active ? active.tagName + '.' + String(active.className || '') : 'null') +
-          ' editables=' + list.length);
-        list.slice(0, 4).forEach((n, i) => {
-          const ta = n as HTMLTextAreaElement;
-          notice('inline dump #' + i + ' ' + n.tagName + '.' + String(n.className || '').slice(0, 40) +
-            ' value=' + (ta.value || '').length + ' def=' + (ta.defaultValue || '').length +
-            ' text=' + (n.textContent || '').length + ' conn=' + n.isConnected +
-            ' vis=' + !!(n.offsetWidth || n.offsetHeight));
-        });
-      } catch { /* ignore */ }
       showToast('没读到输入框内容');
-      notice('inline click: empty text');
       return;
     }
     const lang = sel?.value || targetLang;
-    const label = btn.textContent || '译';
-    btn.disabled = true;
-    btn.textContent = '…';
+    const label = '译';
+    button.disabled = true;
+    button.textContent = '…';
     try {
       const raw: unknown = await backend.translateText(JSON.stringify({ text, lang }));
       const res = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { ok?: boolean; text?: string; error?: string };
       if (!res?.ok || !res.text) throw Error(res?.error || '翻译失败');
+      if (signal?.aborted) return;
+      if (!el.isConnected || editableOf(el) !== el || (target && target !== el) || readEditable(el) !== draft) {
+        button.textContent = label;
+        button.disabled = false;
+        showToast('草稿已变化，未替换内容');
+        return;
+      }
       const out = res.text.trim();
       if (out === text) {
-        btn.textContent = '＝';
+        button.textContent = '＝';
         showToast('原文已是' + lang);
         notice('inline same as source, target=' + lang);
-        win!.setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 1200);
+        win!.setTimeout(() => { button.textContent = label; button.disabled = false; }, 1200);
         return;
       }
       const before = readEditable(el);
@@ -252,17 +232,17 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
       // Steam 的输入框是受控/富文本组件：写进去后它可能用自己的状态把值冲回原文，
       // 表现为“先变译文再变原文”。这里短时间盯一下，被冲回就再写一次。
       const keepWritten = (attempt: number) => {
-        if (!el.isConnected || attempt > 4) return;
+        if (signal?.aborted || !el.isConnected || (target && target !== el) || attempt > 4) return;
         const nowText = readEditable(el).trim();
         if (nowText === out.trim()) return;
         if (nowText === before.trim()) writeEditable(el, out);
         win!.setTimeout(() => keepWritten(attempt + 1), 400);
       };
       win!.setTimeout(() => keepWritten(0), 250);
-      btn.textContent = '✓';
+      button.textContent = '✓';
       let copied = false;
       const ensureKept = () => {
-        if (copied || !before) return;
+        if (signal?.aborted || copied || !before || !el.isConnected) return;
         if (readEditable(el)) return;
         copied = true;
         copyText(out);
@@ -271,12 +251,13 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
       };
       win!.setTimeout(ensureKept, 500);
       win!.setTimeout(ensureKept, 1600);
-      win!.setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 900);
+      win!.setTimeout(() => { button.textContent = label; button.disabled = false; }, 900);
       notice('inline ok, target=' + lang);
     } catch (e) {
+      if (signal?.aborted) return;
       notice('inline failed: ' + String(e));
-      btn.textContent = '×';
-      win!.setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 1200);
+      button.textContent = '×';
+      win!.setTimeout(() => { button.textContent = label; button.disabled = false; }, 1200);
       showToast(String(e).includes('NO_KEY') ? '还没配置 API Key' : '翻译失败');
     }
   }
@@ -315,25 +296,11 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
     if (!el) return;
     win!.clearTimeout(hideTimer);
     target = el;
-    lastText = readEditable(el);
-    recent.push(el);
-    if (recent.length > 6) recent.shift();
     ensureUI();
     if (btn) { btn.disabled = false; btn.textContent = '译'; }
     if (sel) sel.value = targetLang;
     place(el);
-  }, true);
-
-  doc.addEventListener('input', ev => {
-    const el = editableOf(ev.target);
-    if (el) lastText = readEditable(el);
-  }, true);
-
-  doc.addEventListener('pointerdown', ev => {
-    if (ev.target instanceof Element && ev.target.closest('#ds-tr-inline-wrap')) {
-      notice('inline pointerdown on widget');
-    }
-  }, true);
+  }, {capture: true, signal});
 
   doc.addEventListener('focusout', () => {
     if (!target) return;
@@ -342,34 +309,14 @@ export function installInline(doc: Document, onNotice?: (msg: string) => void) {
       if (wrap && wrap.contains(doc.activeElement)) return;
       hide();
     }, 200);
-  }, true);
+  }, {capture: true, signal});
 
-  win.addEventListener('scroll', () => hide(), true);
-  win.addEventListener('resize', () => hide(), true);
-
-  // 临时自测：配置里 debugInline=true 时，6 秒后拿窗口里第一个输入框试一次
-  void (async () => {
-    try {
-      const raw: unknown = await backend.getConfig();
-      const cfg = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { debugInline?: boolean };
-      if (!cfg?.debugInline) return;
-      win!.setTimeout(async () => {
-        const all = doc.querySelectorAll(EDITABLE_SELECTOR);
-        notice('selftest editables=' + all.length + ' title=' + JSON.stringify(doc.title || ''));
-        const el = all[0] as HTMLElement | undefined;
-        if (!el) return;
-        notice('selftest el=' + el.tagName + ' ce=' + (el as HTMLElement).isContentEditable + ' cls=' + String((el as HTMLElement).className || '').slice(0, 60));
-        writeEditable(el, '这是一个测试');
-        el.focus();
-        el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
-        await new Promise(r => win!.setTimeout(r, 600));
-        if (!btn) { notice('selftest no button'); return; }
-        btn.click();
-        await new Promise(r => win!.setTimeout(r, 4500));
-        notice('selftest result title=' + JSON.stringify(doc.title || '') + ' value=' + JSON.stringify(readEditable(el)).slice(0, 140));
-      }, 6000);
-    } catch { /* ignore */ }
-  })();
-  const editables = doc.querySelectorAll(EDITABLE_SELECTOR).length;
-  notice('inline installed title=' + JSON.stringify(doc.title || '') + ' editables=' + editables);
+  win.addEventListener('scroll', () => hide(), {capture: true, signal});
+  win.addEventListener('resize', () => hide(), {capture: true, signal});
+  signal?.addEventListener('abort', () => {
+    win.clearTimeout(hideTimer);
+    wrap?.remove();
+    toast?.remove();
+    marker.__dsTrInlineInstalled = false;
+  }, {once: true});
 }

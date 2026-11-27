@@ -1,5 +1,8 @@
 import { translateBounded } from '../shared/translate';
 import { menuUI } from '../shared/menu';
+import { addSelectionAction } from '../shared/selection';
+import { automaticTranslationEnabled, isPageTextCandidate, privateFields, renderedTranslation, translationContext } from '../shared/policy';
+import { deleteScopedCache, lookupScopedCache, putScopedCache } from '../shared/scoped-cache';
 const { ensureStyle, buildMenu, openPanel, showFailure, field } = menuUI(document);
 /**
  * Steam 翻译助手 — injected into Steam's web views.
@@ -19,8 +22,9 @@ type Phase = 'idle' | 'busy' | 'done';
 const STEAM_HOSTS = /(^|\.)(steamcommunity\.com|store\.steampowered\.com|help\.steampowered\.com|steam\.tv)$/;
 
 const SKIP_SELECTOR = [
+  privateFields,
   'script', 'style', 'noscript', 'svg', 'img', 'code', 'pre',
-  'textarea', '[contenteditable]', '#ds-tr-inline', '#ds-tr-inline-wrap', '#ds-tr-inline-lang', '#ds-tr-error', '#ds-tr-panel', '#ds-tr-menu', '#ds-tr-mask',
+  'textarea', '[contenteditable]', '#ds-tr-inline', '#ds-tr-inline-wrap', '#ds-tr-inline-lang', '#ds-tr-error', '#ds-tr-panel', '#ds-tr-menu', '#ds-tr-mask', '#ds-tr-selection-result',
 ].join(',');
 
 const state = { phase: 'idle' as Phase };
@@ -59,9 +63,19 @@ function menuLabel(): string {
 
 let autoTranslate = false;
 let preferenceReady = false;
+let pageScope = '';
+let pageLanguage = '简体中文';
+let displayMode: 'replace' | 'bilingual' = 'replace';
+let cacheClearPending = false;
+let cacheImportPending = false;
 
 function showMenu(x: number, y: number) {
   let menu = document.getElementById('ds-tr-menu');
+  const context = translationContext(document);
+  if (menu?.dataset.ruleKey && menu.dataset.ruleKey !== context.key) {
+    menu.remove();
+    menu = null;
+  }
   if (!menu) {
     menu = buildMenu(autoTranslate, preferenceReady, enabled => {
       autoTranslate = enabled;
@@ -75,9 +89,11 @@ function showMenu(x: number, y: number) {
         timer = undefined;
         state.phase = origToTr.size ? 'done' : 'idle';
       }
-    });
+    }, context.key, context.label + ' · ');
+    menu.dataset.ruleKey = context.key;
     document.body.appendChild(menu);
   }
+  addSelectionAction(document, menu, hideMenu);
   const action = document.getElementById('ds-tr-action') as HTMLElement;
   action.dataset.mode = state.phase === 'done' ? 'restore' : 'translate';
   action.classList.toggle('disabled', state.phase === 'busy');
@@ -101,8 +117,11 @@ let dirty = false;
 // ── 译文缓存持久化 ───────────────────────────────────────────────────────────
 const pendingPersist = new Map<string, string>();
 let persistTimer: number | undefined;
+let pendingPersistScope = '';
 
 function queuePersist(src: string, tr: string) {
+  if (pendingPersist.size && pendingPersistScope !== pageScope) void flushPersist();
+  if (!pendingPersist.size) pendingPersistScope = pageScope;
   pendingPersist.set(src, tr);
   if (persistTimer !== undefined) return;
   persistTimer = window.setTimeout(() => {
@@ -113,29 +132,36 @@ function queuePersist(src: string, tr: string) {
 
 async function flushPersist() {
   if (!pendingPersist.size) return;
-  const entries: Record<string, string> = {};
+  const entries: Record<string, string> = Object.create(null);
   for (const [k, v] of pendingPersist) entries[k] = v;
+  const scope = pendingPersistScope;
   pendingPersist.clear();
+  pendingPersistScope = '';
   try {
-    await backend.putCache(JSON.stringify({ entries }));
+    await putScopedCache(entries, scope);
   } catch (e) {
     note('cache write failed: ' + String(e));
   }
 }
 
-async function hydrateCache() {
+async function refreshPublicConfig() {
   try {
-    const raw = await backend.getCache();
-    const obj: unknown = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    const map = (obj as { map?: Record<string, string> })?.map ?? (obj as Record<string, string>);
-    if (map && typeof map === 'object') {
-      for (const [k, v] of Object.entries(map)) {
-        if (k && typeof v === 'string' && v) origToTr.set(k, v);
-      }
-    }
-    note('cache hydrated ' + origToTr.size);
+    const raw: unknown = await (backend as any).getPublicConfig();
+    const cfg = (typeof raw === 'string' ? JSON.parse(raw) : raw) as {
+      scope?: string;
+      pageTargetLang?: string;
+      displayMode?: string;
+      autoTranslate?: boolean;
+      autoRules?: Record<string, 'on' | 'off' | 'inherit' | boolean>;
+    };
+    pageScope = cfg?.scope || '';
+    pageLanguage = cfg?.pageTargetLang || '简体中文';
+    displayMode = cfg?.displayMode === 'bilingual' ? 'bilingual' : 'replace';
+    autoTranslate = automaticTranslationEnabled(cfg || {}, translationContext(document));
+    return cfg;
   } catch (e) {
-    note('cache hydrate failed: ' + String(e));
+    note('settings read failed: ' + String(e));
+    return null;
   }
 }
 
@@ -153,20 +179,13 @@ const quickPending = new Map<string, Node[]>();
 let quickTimer: number | undefined;
 
 function isTranslatable(text: string) {
-  if (!text || text.length < 2) return false;
-  const latin = (text.match(/[A-Za-z]/g) || []).length;
-  const han = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  if (latin === 0) return false;
-  // 中文为主的文本（例如 "[DG]简易洗衣机"、中文简介里夹几个英文缩写）不再送翻，
-  // 否则每次悬停都会白花一次请求，还会因为“译文=原文”不进缓存而反复调用。
-  if (han >= latin) return false;
-  return true;
+  return isPageTextCandidate(text, pageLanguage);
 }
 
 function apply(node: Node, text: string, tr: string) {
   const raw = node.nodeValue;
   if (!raw || raw.trim() !== text || text === tr) return;
-  const output = raw.replace(/\S[\s\S]*\S|\S/u, () => tr);
+  const output = renderedTranslation(raw, tr, displayMode);
   originals.set(node, { raw, output });
   node.nodeValue = output;
   touched.add(node);
@@ -184,6 +203,7 @@ function applyCachedNode(node: Node) {
 
 function collectQuick(node: Node) {
   const raw = node.nodeValue || '';
+  if (originals.get(node)?.output === raw) return;
   const text = raw.trim();
   if (!isTranslatable(text)) return;
   if (origToTr.has(text) || origToTr.has(normText(text)) || attempted.has(text) || lookupCached(text)) return;
@@ -193,56 +213,62 @@ function collectQuick(node: Node) {
 }
 
 function scanQuick(node: Node) {
+  if ((node.nodeType === 1 ? node as Element : node.parentElement)?.closest(SKIP_SELECTOR)) return;
   if (node.nodeType === 3) {
     applyCachedNode(node);
     collectQuick(node);
     return;
   }
-  if (node.nodeType === 1 && (node as Element).matches(SKIP_SELECTOR)) return;
+  if (node.nodeType !== 1 && node.nodeType !== 11) return;
   walkTargets(node as Element | ShadowRoot, child => {
     applyCachedNode(child);
     collectQuick(child);
   });
 }
 
-function flushQuick() {
+async function flushQuick() {
   quickTimer = undefined;
   if (state.phase !== 'done' || !quickPending.size) return;
   const texts = Array.from(quickPending.keys()).slice(0, 8);
   for (const t of texts) attempted.add(t);
   const version = generation;
-  translateBounded(texts, () => generation === version)
-    .then(res => {
-      if (generation !== version) { state.phase = 'idle'; return; }
-      if (!res || !Array.isArray(res.texts) || res.texts.length !== texts.length) return;
-      let hits = 0;
-      texts.forEach((text, i) => {
-        const tr = res.texts[i].trim();
+  const scope = pageScope;
+  try {
+    const stored = await cacheLookup(texts, scope);
+    if (generation !== version || scope !== pageScope) return;
+    const missing: string[] = [];
+    let hits = 0;
+    for (const text of texts) {
+      const tr = origToTr.get(text) ?? origToTr.get(normText(text)) ?? stored[text] ?? stored[normText(text)];
+      if (!tr) { missing.push(text); continue; }
+      for (const node of quickPending.get(text) || []) {
+        if (node.isConnected) apply(node, text, tr);
+      }
+      if (tr !== text) hits++;
+    }
+    if (missing.length) {
+      const res = await translateBounded(missing, () => generation === version && pageScope === scope, { scope });
+      if (generation !== version || scope !== pageScope) return;
+      if (!res || !Array.isArray(res.texts) || res.texts.length !== missing.length) return;
+      missing.forEach((text, index) => {
+        const tr = res.texts[index].trim();
         if (!tr) return;
-        if (normText(tr) === normText(text)) {
-          // 原文已经是目标语言（例如 "RimWorld 创意工坊"）：把“不需要翻译”也记下来，
-          // 否则每次悬停/重绘都会再请求一遍，就是那 0.5 秒的来源。
-          origToTr.set(text, text);
-          origToTr.set(normText(text), text);
-          attempted.add(text);
-          queuePersist(text, text);
-          return;
-        }
         origToTr.set(text, tr);
         origToTr.set(normText(text), tr);
         queuePersist(text, tr);
+        queuePersist(normText(text), tr);
         for (const node of quickPending.get(text) || []) {
           if (node.isConnected) apply(node, text, tr);
         }
-        hits++;
+        if (tr !== text) hits++;
       });
-      quickPending.clear();
-      // 悬停浮窗常常是独立窗口且关得很快：立刻落盘，别等 1.2 秒防抖，
-      // 否则第二次悬停时新窗口读不到这条译文，又要重翻。
-      void flushPersist();
-      note(`quick done texts=${texts.length} applied=${hits}`);
-    })
-    .catch(e => note('quick failed: ' + String(e)));
+    }
+    for (const text of texts) quickPending.delete(text);
+    void flushPersist();
+    note(`quick done texts=${texts.length} applied=${hits}`);
+  } catch (error) {
+    note('quick failed: ' + String(error));
+  }
 }
 
 function quickScan(added: Node[]) {
@@ -292,7 +318,7 @@ function redoTranslation() {
   if (!lastSnapshot.length) return;
   let applied = 0;
   for (const item of lastSnapshot) {
-    if (!item.node.isConnected) continue;
+    if (!item.node.isConnected || item.node.nodeValue !== item.raw) continue;
     item.node.nodeValue = item.output;
     originals.set(item.node, { raw: item.raw, output: item.output });
     touched.add(item.node);
@@ -307,7 +333,7 @@ function restore() {
   const snapshot: { node: Node; raw: string; output: string }[] = [];
   for (const node of touched) {
     const record = originals.get(node);
-    if (record && node.isConnected) snapshot.push({ node, raw: record.raw, output: record.output });
+    if (record && node.isConnected && node.nodeValue === record.output) snapshot.push({ node, raw: record.raw, output: record.output });
   }
   if (snapshot.length) lastSnapshot = snapshot;
   generation++;
@@ -330,19 +356,20 @@ function restore() {
 
 // 「重新翻译」：像第一次进页面一样，先洗掉本页的缓存再重翻
 async function forgetPageTexts() {
-  const keys: string[] = [];
+  const keys = new Set<string>();
   walkTargets(document.body, node => {
     const raw = node.nodeValue || '';
     const text = raw.trim();
     if (!text) return;
-    if (origToTr.delete(text)) keys.push(text);
+    if (origToTr.delete(text)) keys.add(text);
+    keys.add(normText(text));
     origToTr.delete(normText(text));
     attempted.delete(text);
   });
-  if (keys.length) {
-    try { await backend.deleteCache(JSON.stringify({ keys })); } catch { /* ignore */ }
+  if (keys.size) {
+    try { await deleteScopedCache(Array.from(keys), pageScope); } catch { /* ignore */ }
   }
-  note('forget page texts=' + keys.length);
+  note('forget page texts=' + keys.size);
 }
 
 async function translate() {
@@ -350,6 +377,8 @@ async function translate() {
   if (state.phase === 'busy') { note('translate skip: busy'); return; }
   dirty = false;
   const version = generation;
+  const scope = pageScope;
+  const current = () => generation === version && pageScope === scope;
   const pending = new Map<string, Node[]>();
   try {
     walkTargets(document.body, node => {
@@ -364,20 +393,33 @@ async function translate() {
         nodes.push(node);
       }
     });
+    const pendingKeys = Array.from(pending.keys());
+    const stored = await cacheLookup(pendingKeys, scope);
+    if (!current()) { state.phase = 'idle'; return; }
+    for (const text of pendingKeys) {
+      const tr = origToTr.get(text) ?? origToTr.get(normText(text)) ?? stored[text] ?? stored[normText(text)];
+      if (!tr) continue;
+      origToTr.set(text, tr);
+      origToTr.set(normText(text), tr);
+      for (const node of pending.get(text) || []) if (node.isConnected) apply(node, text, tr);
+      pending.delete(text);
+    }
     // 全部命中缓存：不要亮“翻译中”，直接把页面填成译文就结束
     if (pending.size === 0) {
       state.phase = 'done';
       note('translate end pending=0 (all cached)');
       void flushPersist();
+      observeQuick();
+      if (quickPending.size && quickTimer === undefined) quickTimer = window.setTimeout(flushQuick, 60);
       return;
     }
     state.phase = 'busy';
 
     let incomplete = false;
     async function request(group: string[]): Promise<void> {
-      if (generation !== version) { state.phase = 'idle'; return; }
-      const res = await translateBounded(group, () => generation === version);
-      if (generation !== version) { state.phase = 'idle'; return; }
+      if (!current()) { state.phase = 'idle'; return; }
+      const res = await translateBounded(group, current, { scope });
+      if (!current()) { state.phase = 'idle'; return; }
 
       if (!Array.isArray(res.texts) || res.texts.length !== group.length ||
           !res.texts.every((s: unknown) => typeof s === 'string' && s.trim())) {
@@ -393,21 +435,24 @@ async function translate() {
         if (tr === text) {
           origToTr.set(text, text);
           origToTr.set(normText(text), text);
+          queuePersist(text, text);
+          queuePersist(normText(text), text);
           return;
         }
         origToTr.set(text, tr);
         origToTr.set(normText(text), tr);
         queuePersist(text, tr);
+        queuePersist(normText(text), tr);
         for (const node of pending.get(text)!) apply(node, text, tr);
       });
     }
     const keys = Array.from(pending.keys());
-    for (let i = 0; i < keys.length && generation === version;) {
+    for (let i = 0; i < keys.length && current();) {
       const group = keys.slice(i, i + (i === 0 ? 4 : 20));
       i += group.length;
       await request(group);
     }
-    if (generation !== version) { state.phase = 'idle'; return; }
+    if (!current()) { state.phase = 'idle'; return; }
     if (incomplete) {
       state.phase = 'done';
       observer.disconnect();
@@ -417,6 +462,8 @@ async function translate() {
     state.phase = 'done';
     note('translate end pending=' + pending.size);
     void flushPersist();
+    observeQuick();
+    if (quickPending.size && quickTimer === undefined) quickTimer = window.setTimeout(flushQuick, 60);
     schedulePrefetch(version);
     if (dirty) schedule();
   } catch (e) {
@@ -447,7 +494,7 @@ let inlineHideTimer: number | undefined;
 
 async function refreshTargetLang() {
   try {
-    const raw: unknown = await backend.getConfig();
+    const raw: unknown = await (backend as any).getPublicConfig();
     const cfg = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { targetLang?: string };
     if (cfg?.targetLang) {
       targetLang = cfg.targetLang;
@@ -474,6 +521,7 @@ function editableOf(target: EventTarget | null): HTMLElement | null {
   if (!el || el.nodeType !== 1 || !(el as Element).closest) return null;
   const found = (el as Element).closest(EDITABLE_SELECTOR) as HTMLElement | null;
   if (!found) return null;
+  if (found.closest(privateFields)) return null;
   // 插件自己的设置面板里不弹
   if (found.closest('#ds-tr-panel')) return null;
   if (found instanceof HTMLInputElement) {
@@ -501,8 +549,8 @@ function writeEditable(el: HTMLElement, value: string) {
   // 用 execCommand 走一次“全选 + 插入”，编辑器才会同步
   try {
     el.focus();
-    doc.execCommand('selectAll', false);
-    const ok = doc.execCommand('insertText', false, value);
+    document.execCommand('selectAll', false);
+    const ok = document.execCommand('insertText', false, value);
     if (!ok) {
       el.innerText = value;
       el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
@@ -533,7 +581,8 @@ async function translateInline() {
   const el = inlineTarget;
   const btn = inlineBtn;
   if (!el || !btn) return;
-  const text = readEditable(el).trim();
+  const draft = readEditable(el);
+  const text = draft.trim();
   if (!text) return;
   const lang = inlineSelect?.value || targetLang;
   const label = btn.textContent || '译';
@@ -543,6 +592,12 @@ async function translateInline() {
     const raw: unknown = await backend.translateText(JSON.stringify({ text, lang }));
     const res = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { ok?: boolean; text?: string; error?: string };
     if (!res?.ok || !res.text) throw Error(res?.error || '翻译失败');
+    if (!el.isConnected || editableOf(el) !== el || readEditable(el) !== draft) {
+      btn.textContent = label;
+      btn.disabled = false;
+      showToast('草稿已变化，未替换内容');
+      return;
+    }
     const translated = res.text.trim();
     if (translated === text) {
       btn.textContent = '＝';
@@ -627,8 +682,6 @@ function setupInlineTranslator() {
 }
 // ── 预翻译工坊简介：悬停弹窗的内容是异步取的，提前翻好放进缓存，
 //    这样第一次悬停也是秒出中文，且之后永远命中缓存 ────────────────────────
-let prefetchDone = false;
-
 let prefetchTimer: number | undefined;
 const prefetchedIds = new Set<string>();
 
@@ -649,20 +702,37 @@ function lookupCached(text: string): string | undefined {
   return undefined;
 }
 
+async function cacheLookup(texts: string[], scope: string): Promise<Record<string, string>> {
+  if (!texts.length) return {};
+  const keys = texts.flatMap(text => [text, normText(text)]);
+  const stored = await lookupScopedCache(keys, scope);
+  for (const text of texts) {
+    const value = stored[text] ?? stored[normText(text)];
+    if (value) {
+      origToTr.set(text, value);
+      origToTr.set(normText(text), value);
+    }
+  }
+  return stored;
+}
+
 async function translateAndCache(texts: string[]) {
+  const scope = pageScope;
+  try { await cacheLookup(texts, scope); } catch { return; }
   const list = texts.filter(x => x && !lookupCached(x)).slice(0, 40);
   if (!list.length) return;
   for (let i = 0; i < list.length; i += 20) {
     const group = list.slice(i, i + 20);
     try {
-      const res = await translateBounded(group, () => true);
+      const res = await translateBounded(group, () => pageScope === scope, { scope });
       if (!res || !Array.isArray(res.texts) || res.texts.length !== group.length) continue;
       group.forEach((text, index) => {
         const tr = (res.texts[index] || '').trim();
-        if (!tr || tr === text) return;
+        if (!tr) return;
         origToTr.set(text, tr);
         origToTr.set(normText(text), tr);
         queuePersist(text, tr);
+        queuePersist(normText(text), tr);
       });
     } catch { /* ignore */ }
   }
@@ -777,6 +847,53 @@ function schedulePrefetch(version: number) {
     warmVisible();
   }, { passive: true });
 }
+
+let settingsRevision = 0;
+async function refreshAfterSettingsChange() {
+  const revision = ++settingsRevision;
+  const oldScope = pageScope;
+  const oldDisplayMode = displayMode;
+  const oldAutoTranslate = autoTranslate;
+  const wasDone = state.phase === 'done';
+  const wasApplied = wasDone || state.phase === 'busy';
+  const clearOnly = cacheClearPending && !cacheImportPending;
+  const cacheImported = cacheImportPending;
+  cacheClearPending = false;
+  cacheImportPending = false;
+  if (clearOnly) {
+    const config = await refreshPublicConfig();
+    if (revision !== settingsRevision || !config) return;
+    state.phase = wasDone ? 'done' : 'idle';
+    return;
+  }
+  generation++;
+  state.phase = 'idle';
+  observer.disconnect();
+  quickObserver.disconnect();
+  if (quickTimer !== undefined) window.clearTimeout(quickTimer);
+  quickTimer = undefined;
+  quickPending.clear();
+  await flushPersist();
+  const config = await refreshPublicConfig();
+  if (revision !== settingsRevision || !config) return;
+  const changed = oldScope !== pageScope || oldDisplayMode !== displayMode;
+  if (oldScope !== pageScope) {
+    origToTr.clear();
+    attempted.clear();
+  }
+  if (oldAutoTranslate && !autoTranslate) {
+    restore();
+    lastSnapshot = [];
+    return;
+  }
+  if (changed) {
+    restore();
+    lastSnapshot = [];
+  }
+  if (autoTranslate && (changed || oldAutoTranslate !== autoTranslate)) await translate();
+  else if (wasApplied && !oldAutoTranslate && changed && (oldScope === pageScope || cacheImported)) await translate();
+}
+
 function watchForRerender() {
   observer = new MutationObserver(schedule);
   // 后出现的内容（悬停简介等）单独走快通道，不受 settle 的 250ms/20 条限制
@@ -792,78 +909,28 @@ function watchForRerender() {
   quickObserver.observe(document.body, { subtree: true, childList: true, characterData: true });
 }
 
-// 自测：URL 带 &dstrtest=1（自造 textarea）或 &dstrtest=2（用页面真实搜索框），
-// 自动点一次「译」并把结果写日志。平时不触发。
-async function inlineSelfTest() {
-  const mode = new URLSearchParams(location.search).get('dstrtest');
-  if (!mode) return;
-  window.setTimeout(async () => {
-    let box: HTMLElement | null = null;
-    if (mode === '2') {
-      box = document.querySelector('input[type="search"], input[type="text"], input[name="search"]') as HTMLElement | null;
-    }
-    if (!box) {
-      const area = document.createElement('textarea');
-      area.style.cssText = 'position:fixed;left:20px;top:220px;width:320px;height:90px;z-index:2147483647';
-      document.body.appendChild(area);
-      box = area;
-    }
-    const seed = (mode === '3' || mode === '4') ? '传送门' : 'Hello, this is a test message from the workshop comment box.';
-    writeEditable(box, seed);
-    box.focus();
-    box.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
-    await new Promise(r => setTimeout(r, 600));
-    const sel = document.getElementById('ds-tr-inline-lang') as HTMLSelectElement | null;
-    if (mode === '4' && sel) {
-      sel.value = 'English';
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-      await new Promise(r => setTimeout(r, 300));
-    }
-    const btn = document.getElementById('ds-tr-inline') as HTMLButtonElement | null;
-    const wrap = document.getElementById('ds-tr-inline-wrap');
-    let geo = 'none';
-    if (wrap) {
-      const r = wrap.getBoundingClientRect();
-      const cs = getComputedStyle(wrap);
-      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-      geo = cs.display + ' ' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) + ' hit=' + (hit ? hit.id || hit.tagName : 'null');
-    }
-    let bgeo = 'none';
-    if (btn) {
-      const br = btn.getBoundingClientRect();
-      const cs2 = getComputedStyle(btn);
-      const hit2 = document.elementFromPoint(br.left + br.width / 2, br.top + br.height / 2);
-      bgeo = cs2.display + ' ' + Math.round(br.left) + ',' + Math.round(br.top) + ' ' + Math.round(br.width) + 'x' + Math.round(br.height) + ' hit=' + (hit2 ? hit2.id || hit2.tagName : 'null');
-    }
-    note('selftest mode=' + mode + ' box=' + box.tagName + ' wrap=' + geo + ' btn=' + bgeo);
-    if (!btn) return;
-    btn.click();
-    await new Promise(r => setTimeout(r, 1500));
-    note('selftest t1=' + JSON.stringify(readEditable(box)).slice(0, 180));
-    await new Promise(r => setTimeout(r, 3500));
-    note('selftest t4=' + JSON.stringify(readEditable(box)).slice(0, 180));
-  }, 3000);
+function observeQuick() {
+  quickObserver.observe(document.body, { subtree: true, childList: true, characterData: true });
 }
+
 export default async function main() {
-  log('preload attached', location.href);
-  try {
-    await backend.noteFromWeb('preload ' + location.href);
-  } catch (e) {
-    log('note failed', String(e));
-  }
   if (!isSteamPage()) return;
+  log('preload attached', location.hostname);
 
   ensureStyle();
   setupInlineTranslator();
   void refreshTargetLang();
   window.setInterval(() => { void refreshTargetLang(); }, 20000);
   watchForRerender();
-  await hydrateCache();
+  await refreshPublicConfig();
 
   document.addEventListener(
     'contextmenu',
     (ev) => {
       if (!isSteamPage()) return;
+      if (ev.shiftKey && ev.button === 2) return;
+      const target = ev.target as Element | null;
+      if (target?.closest?.(`#ds-tr-menu,#ds-tr-inline-wrap,#ds-tr-selection-result,textarea,input,[contenteditable],${privateFields}`)) return;
       ev.preventDefault();
       ev.stopPropagation();
       showMenu(ev.clientX, ev.clientY);
@@ -925,15 +992,26 @@ export default async function main() {
 
   window.addEventListener('scroll', () => hideMenu(), true);
   window.addEventListener('resize', () => hideMenu(), true);
-  window.addEventListener('ds-tr-cache-cleared', () => { origToTr.clear(); attempted.clear(); });
+  window.addEventListener('ds-tr-cache-cleared', () => {
+    origToTr.clear();
+    attempted.clear();
+    cacheClearPending = true;
+    generation++;
+  });
+  window.addEventListener('ds-tr-cache-imported', () => {
+    origToTr.clear();
+    attempted.clear();
+    cacheImportPending = true;
+    generation++;
+  });
+  window.addEventListener('ds-tr-settings-changed', () => { void refreshAfterSettingsChange(); });
   window.addEventListener('pagehide', () => { void flushPersist(); });
 
   // 刚启动时 backend 可能还没就绪，读配置失败就重试几次
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const raw = await backend.getConfig();
-      const config = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      autoTranslate = config.autoTranslate === true;
+      const config = await refreshPublicConfig();
+      if (!config) throw Error('public config unavailable');
       break;
     } catch (e) {
       if (attempt === 3) note('无法读取自动翻译设置: ' + String(e));
@@ -948,5 +1026,4 @@ export default async function main() {
     // 页面可能还没渲染完，2.5 秒后如果没在翻译就再补一次
     window.setTimeout(() => { if (state.phase === 'idle' && !lastSnapshot.length) void translate(); }, 2500);
   }
-  void inlineSelfTest();
 }

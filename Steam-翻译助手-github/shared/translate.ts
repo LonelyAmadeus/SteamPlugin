@@ -26,14 +26,21 @@ function splitLong(text: string, limit: number): string[] {
   return parts;
 }
 
-export async function translateBounded(texts: string[], current: () => boolean) {
+export async function translateBounded(
+  texts: string[],
+  current: () => boolean,
+  options: { scope?: string } = {},
+) {
   const output: string[][] = texts.map(() => []);
   const pieces = texts.flatMap((text, index) =>
     splitLong(text, budget).map(part => ({part, index})));
   type Piece = typeof pieces[number];
   async function send(batch: Piece[]): Promise<void> {
     if (!current()) return;
-    const raw = await backend.translateAll(JSON.stringify({texts: batch.map(p => p.part.trim())}));
+    const raw = await backend.translateAll(JSON.stringify({
+      texts: batch.map(p => p.part.trim()),
+      ...(options.scope ? { scope: options.scope } : {}),
+    }));
     if (!current()) return;
     const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
     const limited = ['OUTPUT_LIMIT', 'HTTP 413'].includes(res.error);

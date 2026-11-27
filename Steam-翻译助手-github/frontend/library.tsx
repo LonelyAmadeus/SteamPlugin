@@ -1,20 +1,14 @@
 import { translateBounded } from '../shared/translate';
 import { menuUI } from '../shared/menu';
 import { installInline } from '../shared/inline';
-import { classMapList, definePlugin } from 'millennium';
-
-const groups = [
-  ['EventDetailsPageContainer', 'EventBodyCtn', 'MajorEvent_Ctn', 'AppDetailsSpotlightContainer', 'MajorEventTextCtn', 'RecentNewsItem', 'AchievementRow', 'GlobalAchievementListItem', 'AchievementHoverContainer'],
-  ['EventBody', 'EventDetailsBody', 'EventDetailsDescription', 'EventDetailTitle', 'EventSummary', 'AchievementDescription', 'AchievementTitle'],
-];
-
-// Reading components found in the installed Steam build, including lazy-loaded modules.
-const installedClasses = [
-  '_3o4SVY-lALGHvkOPxiClcu _1-An2oorO8mDpzICH9p0_S _2_kU7nUB6wwDu-LsbQZmNc _1zDJ1bfFg-UkuAluUAoGKj Ojdg2vBD3O1oroxYVU2zB _2CK1m9x0gtA_oSAQa2FpS3 _2Ptras-ZC31rwdT6pD-t0a _316Uo4SBrQ_beBdSYn2HNO _3eNE5TKtDTnfNBAsCqfcP0 _3SGC6De_ZUjSViw20mnvYv ZjLfk-YYYg2BeAX0wJt3k',
-  '_17dhGq-FsL8xZBes7dOOlN _1hCng1RGOB0Usr_3Uz2ZXg _1i7oUcMQndXEBMEQz2zZ-r _1suo0A05iiYmqbvCk66cm_ _1WP2YDDWrL5LPHoS04AKx8 _207nc4Kas-7zR1DpqbnMqA _2orfVuUro8BNFNNhRfGk4n _2y-2VLgw8KpeOlvqXRvE9m _2yGvZNxeAaVt8SbGgyGMbe _3aht--c1L66YvvpY-Il67f _3NW5vEM9HgfQrgR4W-Xy_s _3XQU8OYiF1A4HeocnI6sdV A_A2B6fTn_MPLlGCmsLtd gK1HBk7JSxeVVDT4FEdOj I0sr90EArZw2mvxW7WgVV LRVqOMfI5WTkpNe1dAnmZ NEMXhMlqXOCJwfgWlHXhT p8bs-3zEou4ZHLLrZozzu TqEPC9bhvVpZ1rb3Z8Mbd UE_Mse5yL68-_H3qFd0Mm',
-];
+import { automaticTranslationEnabled, isPageTextCandidate, privateFields, renderedTranslation, translationContext } from '../shared/policy';
+import { deleteScopedCache, lookupScopedCache, putScopedCache } from '../shared/scoped-cache';
+import { addSelectionAction } from '../shared/selection';
+import { definePlugin } from 'millennium';
+import { SettingsContent } from './index';
 
 type Popup = { window?: Window };
+const skippedText = `script,style,textarea,[contenteditable],code,pre,[aria-expanded],#ds-tr-inline-wrap,#ds-tr-menu,#ds-tr-toast,#ds-tr-selection-result,${privateFields}`;
 type Manager = {
   m_mapPopups: Map<string, Popup>;
   AddPopupCreatedCallback(cb: (popup: Popup) => void): { unregister(): void };
@@ -24,37 +18,35 @@ export default definePlugin(() => {
   const controller = new AbortController();
   const { signal } = controller;
   const attached = new WeakSet<Document>();
-  // 最近一次已知的自动翻译开关状态，用来让菜单一打开就是正确勾选
-  let autoFlag = false;
   const originals = new WeakMap<Text, { raw: string; output: string }>();
 
   const menus = new Set<HTMLElement>();
-  const selectors = groups.map((names, index) => {
-    const classes = new Set(installedClasses[index].split(' '));
-    for (const mod of (classMapList || [])) for (const name of names) {
-      if (typeof mod[name] === 'string') for (const token of mod[name].split(/\s+/)) if (token) classes.add(token);
-    }
-    return [...classes].map(c => '.' + CSS.escape(c)).join(',');
-  });
-
   function attach(win?: Window) {
-    const doc = win?.document;
-    if (!win || !doc || attached.has(doc)) return;
+    if (!win) return;
+    const doc = win.document;
+    if (attached.has(doc)) return;
     attached.add(doc);
+    let autoFlag = false;
     // 上一次「还原原文」之前保存的译文快照，用于「还原翻译」
     let snapshot: { node: Text; raw: string; output: string }[] = [];
     const ui = menuUI(doc);
-    installInline(doc, msg => { backend.noteFromWeb('inline: ' + msg).catch(() => undefined); });
+    installInline(doc, msg => { backend.noteFromWeb('inline: ' + msg).catch(() => undefined); }, signal);
     let menu: HTMLElement | undefined;
     function close() {
       if (menu) { menu.remove(); menus.delete(menu); menu = undefined; }
     }
     let active: Element | undefined;
+    let activeContext = '';
     let observer: MutationObserver | undefined;
     let version = 0;
     let running = false;
     let dirty = false;
     let failure = '';
+    let cacheScope = '';
+    let pageLanguage = '简体中文';
+    let displayMode: 'replace' | 'bilingual' = 'replace';
+    let cacheClearPending = false;
+    let cacheImportPending = false;
     const cache = new Map<string, string>();
     // 归一化索引：把多空白压成单空格，解决网页侧/客户端侧同一句话
     // 因为换行、缩进不同而 cache miss 的问题。
@@ -64,40 +56,41 @@ export default definePlugin(() => {
     // 否则库内界面每次开 Steam 都要重新翻一遍。
     const pendingPersist = new Map<string, string>();
     let persistTimer: number | undefined;
+    let pendingPersistScope = '';
     function queuePersist(key: string, value: string) {
+      if (pendingPersist.size && pendingPersistScope !== cacheScope) void flushPersist();
+      if (!pendingPersist.size) pendingPersistScope = cacheScope;
       pendingPersist.set(key, value);
       if (persistTimer !== undefined) return;
       persistTimer = win!.setTimeout(() => { persistTimer = undefined; void flushPersist(); }, 1200);
     }
     async function flushPersist() {
       if (!pendingPersist.size) return;
-      const entries: Record<string, string> = {};
+      const entries: Record<string, string> = Object.create(null);
       for (const [k, v] of pendingPersist) entries[k] = v;
+      const scope = pendingPersistScope;
       pendingPersist.clear();
-      try { await backend.putCache(JSON.stringify({ entries })); } catch { /* ignore */ }
+      pendingPersistScope = '';
+      try { await putScopedCache(entries, scope); } catch { /* ignore */ }
     }
     const cacheReady = (async () => {
       try {
-        const raw: unknown = await backend.getCache();
-        const obj = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { map?: Record<string, string> } & Record<string, string>;
-        const map = obj?.map ?? obj;
-        if (map && typeof map === 'object') {
-          for (const [k, v] of Object.entries(map)) {
-            if (typeof v !== 'string' || !v) continue;
-            cache.set(k, v);
-            cacheNorm.set(normKey(k), v);
-          }
-        }
-      } catch { /* 读取失败就退回纯内存缓存 */ }
-      void backend.noteFromWeb('fe cache ready size=' + cache.size).catch(() => undefined);
+        const raw: unknown = await (backend as any).getPublicConfig();
+        const cfg = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { scope?: string; displayMode?: string; pageTargetLang?: string };
+        cacheScope = cfg?.scope || '';
+        pageLanguage = cfg?.pageTargetLang || '简体中文';
+        displayMode = cfg?.displayMode === 'bilingual' ? 'bilingual' : 'replace';
+      } catch { /* cache is unavailable until settings can be read */ }
     })();
 
     function stop() {
       version++;
       observer?.disconnect();
       active = undefined;
+      activeContext = '';
       running = dirty = false;
       cache.clear();
+      cacheNorm.clear();
       failure = '';
     }
 
@@ -106,17 +99,10 @@ export default definePlugin(() => {
       const translated: Text[] = [];
       const walker = root.ownerDocument.createTreeWalker(root, 4);
       for (let n = walker.nextNode() as Text; n; n = walker.nextNode() as Text) {
-        if (n.parentElement?.closest('script,style,textarea,[contenteditable],code,pre')) continue;
-        if (n.parentElement?.closest('#ds-tr-inline-wrap,#ds-tr-menu,#ds-tr-panel,#ds-tr-toast')) continue;
-        // 展开/折叠这类开关行（带 aria-expanded）不翻，避免改文本打断它的状态切换
-        if (n.parentElement?.closest('[aria-expanded]')) continue;
+        if (n.parentElement?.closest(skippedText)) continue;
         if (originals.get(n)?.output === n.data) { translated.push(n); continue; }
         const key = n.data.trim();
-        {
-          const latin = (key.match(/[A-Za-z]/g) || []).length;
-          const han = (key.match(/[\u4e00-\u9fff]/g) || []).length;
-          if (latin === 0 || han >= latin) continue;
-        }
+        if (!isPageTextCandidate(key, pageLanguage)) continue;
         if (!pending.has(key)) pending.set(key, []);
         pending.get(key)!.push(n);
       }
@@ -126,11 +112,15 @@ export default definePlugin(() => {
     async function update() {
       dirty = true;
       if (running || !active) return;
-      await cacheReady;
       running = true;
       const root = active;
       const epoch = version;
-      const current = () => version === epoch && root.isConnected && !signal.aborted;
+      await cacheReady;
+      if (version !== epoch) return;
+      const scope = cacheScope;
+      const context = activeContext;
+      const current = () => version === epoch && root.isConnected && cacheScope === scope && !signal.aborted
+        && translationContext(doc, root).key === context;
       try {
         while (dirty && current()) {
           dirty = false;
@@ -138,21 +128,29 @@ export default definePlugin(() => {
           function apply(key: string, tr: string) {
             for (const n of pending.get(key)!) {
               if (!root.contains(n) || n.data.trim() !== key) continue;
-              const output = n.data.replace(/\S[\s\S]*\S|\S/u, () => tr);
+              const output = renderedTranslation(n.data, tr, displayMode);
               originals.set(n, {raw: n.data, output});
               if (n.data !== output) n.data = output;
             }
           }
+          const pendingKeys = Array.from(pending.keys());
+          const lookupKeys = pendingKeys.flatMap(key => [key, normKey(key)]);
+          const stored = await lookupScopedCache(lookupKeys, scope);
+          if (!current()) return;
           const keys: string[] = [];
           for (const key of pending.keys()) {
-            const hit = cache.get(key) ?? cacheNorm.get(normKey(key));
-            if (hit) apply(key, hit);
-            else keys.push(key);
+            const normalized = normKey(key);
+            const hit = cache.get(key) ?? cacheNorm.get(normalized) ?? stored[key] ?? stored[normalized];
+            if (hit) {
+              cache.set(key, hit);
+              cacheNorm.set(normalized, hit);
+              apply(key, hit);
+            } else keys.push(key);
           }
           async function request(batch: string[]): Promise<void> {
             if (!current()) return;
             void backend.noteFromWeb('fe req n=' + batch.length).catch(() => undefined);
-            const res = await translateBounded(batch, current);
+            const res = await translateBounded(batch, current, { scope });
             if (!current()) return;
 
             if (!Array.isArray(res.texts) || res.texts.length !== batch.length ||
@@ -187,8 +185,6 @@ export default definePlugin(() => {
       } finally { if (epoch === version) running = false; }
     }
 
-    const spotlight = '.Ojdg2vBD3O1oroxYVU2zB,._2nr7NuawYs9NhC8OUkY0fK,._1zDJ1bfFg-UkuAluUAoGKj,._2_kU7nUB6wwDu-LsbQZmNc';
-    const dialog = '[role="dialog"],dialog,._2Ptras-ZC31rwdT6pD-t0a';
     const suppressed = new WeakSet<Element>();
     let last: Element | null | undefined;
     // 用户点了「还原原文」后，当前页面不要再被自动翻译接管；
@@ -197,7 +193,7 @@ export default definePlugin(() => {
     function appIdOf(details: Element | null): string | null {
       if (!details) return null;
       const withId = details.querySelector('[data-appid]');
-      return withId ? withId.getAttribute('data-appid') : null;
+      return details.getAttribute('data-appid') || withId?.getAttribute('data-appid') || null;
     }
     let check = 0;
     let timer: number | undefined;
@@ -221,13 +217,15 @@ export default definePlugin(() => {
         cacheNorm.delete(normKey(k));
       }
       if (keys.size) {
-        try { await backend.deleteCache(JSON.stringify({ keys: Array.from(keys) })); } catch { /* ignore */ }
+        for (const key of Array.from(keys)) keys.add(normKey(key));
+        try { await deleteScopedCache(Array.from(keys), cacheScope); } catch { /* ignore */ }
       }
       void backend.noteFromWeb('fe forget texts=' + keys.size + ' removed=' + removed).catch(() => undefined);
     }
     function start(root: Element) {
       stop();
       active = root;
+      activeContext = translationContext(doc, root).key;
       // 同样避开 React 提交阶段：下一帧再扫，否则展开/折叠状态会被回滚
       observer = new MutationObserver(() => { win!.requestAnimationFrame(() => { void update(); }); });
       observer.observe(root, {subtree: true, childList: true, characterData: true});
@@ -237,7 +235,7 @@ export default definePlugin(() => {
     async function configWithRetry(tries = 4): Promise<any> {
       for (let i = 0; i < tries; i++) {
         try {
-          const raw = await backend.getConfig();
+          const raw = await (backend as any).getPublicConfig();
           return typeof raw === 'string' ? JSON.parse(raw) : raw;
         } catch (e) {
           if (i === tries - 1) throw e;
@@ -261,22 +259,95 @@ export default definePlugin(() => {
       return null;
     }
 
-    async function discover(force = false) {
+    function restoreRoot(root: Element) {
+      for (const node of scan(root).translated) {
+        const record = originals.get(node);
+        if (!record) continue;
+        node.data = record.raw;
+        originals.delete(node);
+      }
+    }
+
+    async function refreshSettings() {
+      const clearOnly = cacheClearPending && !cacheImportPending;
+      const cacheImported = cacheImportPending;
+      cacheClearPending = false;
+      cacheImportPending = false;
+      let cfg: any;
+      try { cfg = await configWithRetry(); } catch { return; }
+      const root = active || currentRoot();
+      const wasActive = !!active;
+      const wasAutomatic = automatic;
+      const oldScope = cacheScope;
+      const oldDisplayMode = displayMode;
+      const nextScope = typeof cfg.scope === 'string' ? cfg.scope : '';
+      cacheScope = nextScope;
+      pageLanguage = cfg.pageTargetLang || '简体中文';
+      displayMode = cfg.displayMode === 'bilingual' ? 'bilingual' : 'replace';
+      const enabled = root ? automaticTranslationEnabled(cfg, translationContext(doc, root)) : cfg.autoTranslate === true;
+      autoFlag = enabled;
+      const settingsChanged = oldScope !== cacheScope || oldDisplayMode !== displayMode;
+      if (clearOnly) {
+        cache.clear();
+        cacheNorm.clear();
+        running = false;
+        dirty = false;
+        return;
+      }
+      if (settingsChanged) {
+        void flushPersist();
+        cache.clear();
+        cacheNorm.clear();
+        snapshot = [];
+      }
+      if (wasActive && root && (settingsChanged || wasAutomatic !== enabled)) {
+        restoreRoot(root);
+        stop();
+        const shouldResume = settingsChanged ? (enabled || (!wasAutomatic && (oldScope === cacheScope || cacheImported))) : enabled;
+        if (shouldResume && root.isConnected) {
+          automatic = enabled;
+          suppressed.delete(root);
+          await start(root);
+        } else {
+          automatic = false;
+        }
+      } else if (!wasActive && root && enabled) {
+        automatic = true;
+        suppressed.delete(root);
+        await start(root);
+      }
+    }
+
+    async function discover(force = false): Promise<void> {
       // 好友列表窗口不自动翻译（会把人名翻掉），聊天窗口不在此列
       if (/好友列表|friends\s*list/i.test(doc.title || '')) return;
       // 自动翻译只作用于「游戏详情页」和「聊天窗口」。
       // 库首页（最近游玩、货架）不自动翻，避免把主页文字翻掉、也避免还原失效。
       const root: Element | null = currentRoot();
-      if (!root) return;
+      if (!root) {
+        if (automatic && active) { stop(); automatic = false; }
+        return;
+      }
+      const context = translationContext(doc, root);
+      if (active && active === root && activeContext !== context.key) {
+        stop();
+        snapshot = [];
+        automatic = false;
+      }
       // 已经在这个 root 上自动翻译时才跳过；否则（被还原过/换过页）继续接管
       if (!force && root === last && active === root) return;
       last = root;
       const ticket = ++check;
       try {
         const cfg = await configWithRetry();
-        if (ticket !== check || signal.aborted || !root.isConnected) return;
-        autoFlag = cfg.autoTranslate === true;
-        if (cfg.autoTranslate === true) {
+        if (ticket !== check || signal.aborted || !root.isConnected || translationContext(doc, root).key !== context.key) return;
+        const priorScope = cacheScope;
+        cacheScope = typeof cfg.scope === 'string' ? cfg.scope : cacheScope;
+        pageLanguage = cfg.pageTargetLang || '简体中文';
+        displayMode = cfg.displayMode === 'bilingual' ? 'bilingual' : 'replace';
+        if (priorScope !== cacheScope) { cache.clear(); cacheNorm.clear(); }
+        autoFlag = automaticTranslationEnabled(cfg, context);
+        if (autoFlag) {
           if (restoreGuard) {
             const detailsNow = win!.document.querySelector('.AppDetailsMain');
             const samePage = restoreGuard.root === root
@@ -301,11 +372,12 @@ export default definePlugin(() => {
       if (timer !== undefined) return;
       timer = win.setTimeout(() => { timer = undefined; void discover(); }, 180);
     });
-    discovery.observe(doc, {childList: true, subtree: true});
+    discovery.observe(doc, {childList: true, subtree: true, attributes: true, attributeFilter: ['data-appid']});
 
     // 列表虚拟滚动会重建节点：新节点一出现就用缓存立刻回填，
     // 避免“滑走闪回原文、滑回来再翻一次”；还原之后（active 为空）停止补翻。
     function applyCachedText(node: Node) {
+      if ((node.nodeType === 1 ? node as Element : node.parentElement)?.closest(skippedText)) return;
       if (node.nodeType === 3) {
         const raw = node.nodeValue || '';
         const text = raw.trim();
@@ -314,16 +386,13 @@ export default definePlugin(() => {
         if (!tr || tr === text) return;
         const record = originals.get(node as Text);
         if (record && record.output === raw) return;
-        const output = raw.replace(/\S[\s\S]*\S|\S/u, () => tr);
+        const output = renderedTranslation(raw, tr, displayMode);
         originals.set(node as Text, { raw, output });
         (node as Text).data = output;
         return;
       }
       if (node.nodeType !== 1) return;
       const el = node as Element;
-      if (el.closest && el.closest('script,style,textarea,[contenteditable="true"]')) return;
-      if (el.closest && el.closest('#ds-tr-inline-wrap,#ds-tr-menu,#ds-tr-panel,#ds-tr-toast')) return;
-      if (el.closest && el.closest('[aria-expanded]')) return;
       const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
       let n: Node | null;
       while ((n = walker.nextNode())) applyCachedText(n);
@@ -342,37 +411,36 @@ export default definePlugin(() => {
       applyRaf = win!.requestAnimationFrame(() => {
         applyRaf = 0;
         const batch = pendingApply.splice(0);
-        for (const n of batch) { if (n.isConnected) applyCachedText(n); }
+        if (!active || translationContext(doc, active).key !== activeContext) return;
+        for (const n of batch) { if (active.contains(n)) applyCachedText(n); }
       });
     });
     cacheApplier.observe(doc.body, { childList: true, subtree: true });
     signal.addEventListener('abort', () => cacheApplier.disconnect(), { once: true });
     void discover();
-    win.setTimeout(() => void discover(true), 2500);
-    win.setTimeout(() => void discover(true), 7000);
+    const firstRetry = win.setTimeout((): void => { void discover(true); }, 2500);
+    const secondRetry = win.setTimeout((): void => { void discover(true); }, 7000);
     // 自动翻译开着时定期兜底，防止某次 stop/还原后不再接管
-    win.setInterval(() => void discover(), 4000);
+    const discoverTimer = win.setInterval((): void => { void discover(); }, 4000);
     win.addEventListener('focus', () => void discover(true), {signal});
+    win.addEventListener('ds-tr-settings-changed', () => { void refreshSettings(); }, {signal});
     function cleanup() {
       check++;
       discovery.disconnect();
       win?.clearTimeout(timer);
+      win?.clearTimeout(firstRetry);
+      win?.clearTimeout(secondRetry);
+      win?.clearInterval(discoverTimer);
+      win?.clearTimeout(persistTimer);
+      if (applyRaf) win?.cancelAnimationFrame(applyRaf);
+      void flushPersist();
+      ui.closePanel();
       stop();
       close();
     }
     signal.addEventListener('abort', cleanup, {once: true});
     win.addEventListener('mousedown', e => { if (e.button !== 2 && !menu?.contains(e.target as Node)) close(); }, { capture: true, signal });
     win.addEventListener('pagehide', cleanup, { signal });
-    const detailsPage = [
-      '_3fp5y6tdU77MdrCQZt_aS9', '_2-ns_GqXzymHk0jsXBBWJ1', '_1DLmEVjfX3d7Ec8CW7vJnt',
-      '_2Nq6ov7A1hGcHXVOXNt_OE', '_3YbIHh6FwfB9zQVNU18OSy', 'ETHkFxrlPF1znTFXFtjtK',
-    ];
-    for (const mod of classMapList || []) {
-      for (const key of ['AppDetailsRoot', 'AppDetailsContainer', 'AppDetailsMain', 'AppDetails']) {
-        if (typeof mod[key] === 'string') detailsPage.push(...mod[key].split(/\s+/).filter(Boolean));
-      }
-    }
-    const pageSelector = detailsPage.map(c => '.' + CSS.escape(c)).join(',');
     let ownsRightClick = false;
     function consume(e: Event) {
       e.preventDefault();
@@ -399,6 +467,7 @@ export default definePlugin(() => {
     }
 
     function openMenu(e: MouseEvent) {
+      if (e.shiftKey && e.button === 2) { ownsRightClick = false; return; }
       if (e.type === 'pointerdown') ownsRightClick = false;
       if (e.type === 'contextmenu' && (menu?.contains(e.target as Node) || (ownsRightClick && e.button === 2))) {
         void backend.noteFromWeb('cm early: ' + (menu?.contains(e.target as Node) ? 'inside-menu' : 'ownsRightClick') + ' menu=' + !!menu).catch(() => undefined);
@@ -409,12 +478,11 @@ export default definePlugin(() => {
       if (e.type === 'pointerdown' && e.button !== 2) return;
       const el = e.target as Element;
       if (!el?.closest) return;
-      const hit = selectors.reduce<Element | null>((found, s) => found || (s ? el.closest(s) : null), null);
-      const page = el.closest(pageSelector);
+      if (el.closest(`#ds-tr-selection-result,${privateFields}`)) return;
       // 聊天窗口没有“页面”概念；Millennium 设置页也不在组件选择器里。
       // 这两种情况下允许右键出菜单，但输入框里保留 Steam 自带菜单。
-      const inEditable = !!(el.closest && el.closest('textarea, input, [contenteditable="true"]'));
-      const isChat = !inEditable && !!doc.querySelector('.chatTextarea, .chatHistory, [class*="chatHistory"]');
+      const inEditable = !!(el.closest && el.closest('textarea, input, [contenteditable]'));
+      if (inEditable) return;
       const settingsRoot = inEditable ? null : millenniumContainerFor(el);
       // 只接管「游戏详情页（AppDetailsMain 内部）/ 弹窗 / 聊天 / Millennium 设置页」。
       // 库首页、左侧游戏列表这类地方 Steam 自带右键菜单有实用功能（收藏、属性、隐藏），不能抢。
@@ -425,6 +493,9 @@ export default definePlugin(() => {
       ownsRightClick = e.type === 'pointerdown';
       consume(e);
       close();
+      const context = settingsRoot
+        ? { key: 'steam:other', label: 'Steam 设置', fallbackKeys: ['steam:other'] }
+        : translationContext(doc, root);
       const { translated, pending } = scan(root);
       void backend.noteFromWeb('cm scan pending=' + pending.size + ' translated=' + translated.length).catch(() => undefined);
       ui.ensureStyle();
@@ -438,16 +509,17 @@ export default definePlugin(() => {
           suppressed.delete(root);
           void start(root);
         } else { stop(); automatic = false; }
-      });
+      }, context.key, context.label + ' · ');
+      addSelectionAction(doc, box, close);
       menu = box;
       menus.add(box);
       root.ownerDocument.body.appendChild(box);
       void backend.noteFromWeb('cm appended').catch(() => undefined);
       const toggle = box.querySelector<HTMLInputElement>('#ds-tr-auto')!;
-      void backend.getConfig().then(raw => {
+      void (backend as any).getPublicConfig().then((raw: unknown) => {
         const config = typeof raw === 'string' ? JSON.parse(raw) : raw;
         // 用户刚点过就以用户的为准，别用旧配置把它盖回未勾选
-        if (toggle.dataset.userToggled !== '1') toggle.checked = config.autoTranslate === true;
+        if (toggle.dataset.userToggled !== '1') toggle.checked = automaticTranslationEnabled(config, context);
         toggle.disabled = false;
       }).catch(() => { toggle.title = '读取设置失败'; });
       const retry = active === root && !!failure;
@@ -465,7 +537,7 @@ export default definePlugin(() => {
         close();
         let applied = 0;
         for (const item of snapshot) {
-          if (!item.node.isConnected) continue;
+          if (!item.node.isConnected || item.node.data !== item.raw) continue;
           item.node.data = item.output;
           originals.set(item.node, { raw: item.raw, output: item.output });
           applied++;
@@ -516,25 +588,31 @@ export default definePlugin(() => {
       };
     }
     win.addEventListener('pointerdown', openMenu, { capture: true, signal });
-    win.addEventListener('ds-tr-cache-cleared', () => { cache.clear(); cacheNorm.clear(); });
+    win.addEventListener('ds-tr-cache-cleared', () => {
+      cache.clear();
+      cacheNorm.clear();
+      cacheClearPending = true;
+      version++;
+      running = false;
+    }, {signal});
+    win.addEventListener('ds-tr-cache-imported', () => {
+      cache.clear();
+      cacheNorm.clear();
+      cacheImportPending = true;
+      version++;
+      running = false;
+    }, {signal});
     for (const type of ['mousedown', 'mouseup', 'pointerup', 'auxclick'] as const) {
       win.addEventListener(type, consumeRightButton, { capture: true, signal });
     }
     win.addEventListener('contextmenu', openMenu, { capture: true, signal });
-    win.addEventListener('error', ev => {
-      void backend.noteFromWeb('cm window error: ' + String((ev as ErrorEvent).message || '')).catch(() => undefined);
-    }, { capture: true, signal });
-    win.addEventListener('contextmenu', ev => {
-      const target = ev.target as Element;
-      void backend.noteFromWeb('cm event target=' + (target ? target.tagName + '.' + String(target.className || '').slice(0, 40) : 'null') + ' doc=' + JSON.stringify(doc.title || '')).catch(() => undefined);
-    }, { capture: true, signal });
   }
 
   attach(window);
   const manager = (window as Window & {g_PopupManager?: Manager}).g_PopupManager;
   const hook = manager?.AddPopupCreatedCallback(p => attach(p.window));
   manager?.m_mapPopups.forEach(p => attach(p.window));
-  return { icon: <span>译</span>, onDismount() {
+  return { icon: <span>译</span>, title: 'Steam 翻译助手', content: <SettingsContent />, onDismount() {
     controller.abort();
     hook?.unregister();
     menus.forEach(m => m.remove());

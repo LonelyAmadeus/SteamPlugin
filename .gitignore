@@ -1,0 +1,12 @@
+node_modules/
+.millennium/
+/Steam-翻译助手-github/.gitignore
+/Steam-翻译助手-github/.luarc.json
+baseline/
+dist
+.env
+.env.*
+ds-tr-config.json*
+ds-tr-cache*.json*
+steamtranslator-cache*.json
+ds-tr.log*

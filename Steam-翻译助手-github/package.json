@@ -1,15 +1,22 @@
 {
+  "name": "steamtranslator",
+  "version": "1.1.0",
+  "private": true,
+  "packageManager": "bun@1.3.14",
   "scripts": {
-    "dev": "./node_modules/.bin/starlight watch",
-    "build": "./node_modules/.bin/starlight pack",
-    "prepare": "./node_modules/.bin/starlight lsp"
+    "dev": "starlight watch",
+    "typecheck": "starlight lsp && tsc --noEmit",
+    "build": "starlight pack --release",
+    "inspect": "starlight inspect \"Steam-翻译助手.star\"",
+    "prepare": "starlight lsp"
   },
   "devDependencies": {
     "@types/react": "19.1.1",
     "@types/react-dom": "19.1.1",
-    "@steambrew/starlight": "^1.1.3"
+    "@steambrew/starlight": "1.1.7",
+    "typescript": "5.8.3"
   },
   "dependencies": {
-    "@steambrew/client": "^5.8.5"
+    "@steambrew/client": "5.8.5"
   }
 }

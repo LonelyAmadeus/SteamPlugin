@@ -1,3 +1,5 @@
+import { settingsUI } from './settings';
+
 const menuCSS = `
 #ds-tr-toast {
   position: fixed; z-index: 2147483647; display: none;
@@ -22,7 +24,7 @@ const menuCSS = `
 #ds-tr-inline-lang:hover { border-color: #66c0f4; }
 
 #ds-tr-inline {
-  position: static; display: none;
+  position: static; display: block;
   width: 30px; height: 24px; padding: 0; line-height: 22px;
   background: #2a475e; color: #fff; border: 1px solid #66c0f4;
   border-radius: 4px; font-size: 12px; cursor: pointer;
@@ -49,6 +51,7 @@ const menuCSS = `
   transform: translate(-50%, -50%); width: 520px; max-width: 92vw;
   background: #1b2838; border: 1px solid #2a475e; border-radius: 4px;
   box-shadow: 0 8px 30px rgba(0,0,0,.7); padding: 16px; color: #c7d5e0;
+  max-height: 90vh; overflow: auto;
   font-size: 13px; font-family: inherit; display: none;
 }
 #ds-tr-panel h3 { margin: 0 0 4px; font-size: 15px; color: #fff; }
@@ -75,6 +78,8 @@ const menuCSS = `
 `;
 
 export function menuUI(document: Document) {
+  const settings = settingsUI(document);
+
   function ensureStyle() {
     if (document.getElementById('ds-tr-style')) return;
     const style = document.createElement('style');
@@ -83,7 +88,13 @@ export function menuUI(document: Document) {
     document.head.appendChild(style);
   }
 
-  function buildMenu(autoTranslate: boolean, preferenceReady: boolean, changed: (enabled: boolean) => void): HTMLElement {
+  function buildMenu(
+    autoTranslate: boolean,
+    preferenceReady: boolean,
+    changed: (enabled: boolean) => void,
+    ruleKey = 'steam:other',
+    ruleLabel = '当前页面',
+  ): HTMLElement {
     const menu = document.createElement('div');
     menu.id = 'ds-tr-menu';
 
@@ -99,7 +110,8 @@ export function menuUI(document: Document) {
     toggle.id = 'ds-tr-auto';
     toggle.checked = autoTranslate;
     toggle.disabled = !preferenceReady;
-    label.append(toggle, '自动翻译');
+    label.title = '此游戏或页面的规则覆盖全局默认';
+    label.append(toggle, ruleLabel + '自动翻译');
     row.append(action, label);
     menu.appendChild(row);
     toggle.addEventListener('change', async () => {
@@ -108,12 +120,17 @@ export function menuUI(document: Document) {
       toggle.dataset.userToggled = '1';
       toggle.disabled = true;
       try {
-        const raw = await backend.setConfig(JSON.stringify({autoTranslate: enabled}));
+        const raw = await backend.setConfig(JSON.stringify({ rulePatch: { key: ruleKey, mode: enabled ? 'on' : 'off' } }));
         const result = typeof raw === 'string' ? JSON.parse(raw) : raw;
         try { await backend.noteFromWeb('auto save enabled=' + enabled + ' ok=' + !!(result && result.ok) + ' err=' + String((result && result.error) || '')); } catch { /* ignore */ }
         if (!result.ok) throw Error(result.error);
 
         changed(enabled);
+        const view = document.defaultView;
+        if (view) {
+          view.dispatchEvent(new view.CustomEvent('ds-tr-settings-changed'));
+          document.dispatchEvent(new view.CustomEvent('ds-tr-settings-changed'));
+        }
       } catch {
         toggle.checked = !enabled;
         label.title = '设置保存失败，请重试';
@@ -142,130 +159,8 @@ export function menuUI(document: Document) {
     return menu;
   }
 
-  function field(id: string): HTMLInputElement | null {
-    return document.getElementById(id) as HTMLInputElement | null;
-  }
-
-  function setStatus(text: string) {
-    const el = document.querySelector('#ds-tr-panel .status');
-    if (el) el.textContent = text;
-  }
-
-  async function readCfg() {
-    try {
-      const raw: any = await backend.getConfig();
-      const cfg = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (field('ds-tr-in-key')) field('ds-tr-in-key')!.value = cfg?.apiKey || '';
-      if (field('ds-tr-in-url')) field('ds-tr-in-url')!.value = cfg?.url || '';
-      if (field('ds-tr-in-model')) field('ds-tr-in-model')!.value = cfg?.model || '';
-
-      setStatus('已读取当前配置');
-    } catch (e) {
-      setStatus('读取失败');
-    }
-  }
-
-  async function saveCfg() {
-    try {
-      const payload = {
-        apiKey: field('ds-tr-in-key')?.value || '',
-        url: field('ds-tr-in-url')?.value || '',
-        model: field('ds-tr-in-model')?.value || '',
-      };
-      const res: any = await backend.setConfig(JSON.stringify(payload));
-      if (!res?.ok) setStatus('保存失败');
-      else if (res.hasKey) setStatus('已保存，立即生效');
-      else setStatus('已保存（未填 Key，翻译时会提示设置）');
-    } catch (e) {
-      setStatus('保存失败');
-    }
-  }
-
-  function closePanel() {
-    const mask = document.getElementById('ds-tr-mask');
-    const panel = document.getElementById('ds-tr-panel');
-    if (mask) mask.style.display = 'none';
-    if (panel) panel.style.display = 'none';
-  }
-
   function openPanel() {
-    let mask = document.getElementById('ds-tr-mask');
-    if (!mask) {
-      mask = document.createElement('div');
-      mask.id = 'ds-tr-mask';
-      document.body.appendChild(mask);
-      mask.addEventListener('click', closePanel);
-    }
-
-    let panel = document.getElementById('ds-tr-panel');
-    if (!panel) {
-      panel = document.createElement('div');
-      panel.id = 'ds-tr-panel';
-      panel.innerHTML =
-        '<h3>Steam 翻译助手 · API 设置</h3>' +
-        '<div class="hint">OpenAI 兼容接口。改完点保存，立即生效，无需重启。</div>' +
-        '<label>API Key</label><input id="ds-tr-in-key" placeholder="sk-..." />' +
-        '<label>接口地址</label><input id="ds-tr-in-url" placeholder="https://api.deepseek.com/chat/completions" />' +
-        '<label>模型</label><input id="ds-tr-in-model" placeholder="deepseek-chat" />' +
-        '<div class="row" style="margin-top:12px;align-items:center">' +
-        '<span class="hint" id="ds-tr-cache-stats" style="margin:0;flex:1">缓存：读取中…</span>' +
-        '<button id="ds-tr-clear-cache" class="ghost" style="padding:4px 10px">清除缓存</button>' +
-        '</div>' +
-
-        '<div class="row">' +
-        '<button id="ds-tr-save">保存</button>' +
-        '<button id="ds-tr-read" class="ghost">读取当前</button>' +
-        '<button id="ds-tr-close" class="ghost">关闭</button>' +
-        '<span class="status"></span>' +
-        '</div>';
-      document.body.appendChild(panel);
-
-      panel.querySelector('#ds-tr-close')?.addEventListener('click', closePanel);
-      panel.querySelector('#ds-tr-save')?.addEventListener('click', saveCfg);
-      panel.querySelector('#ds-tr-read')?.addEventListener('click', readCfg);
-      panel.querySelector('#ds-tr-clear-cache')?.addEventListener('click', clearCacheAll);
-    }
-
-    mask.style.display = 'block';
-    panel.style.display = 'block';
-    readCfg();
-    void refreshCacheStats();
-  }
-
-  async function clearCacheAll() {
-    const btn = document.getElementById('ds-tr-clear-cache') as HTMLButtonElement | null;
-    if (!window.confirm('确定清除所有翻译缓存？\n之后所有页面都会重新调用 API 翻译。')) return;
-    if (btn) btn.disabled = true;
-    try {
-      const raw: any = await (backend as any).clearCache();
-      const res = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { ok?: boolean };
-      setStatus(res?.ok ? '缓存已清除' : '清除失败');
-      if (res?.ok) {
-        // 通知当前页/窗口丢掉内存里的副本，避免“清了又写回”
-        window.dispatchEvent(new CustomEvent('ds-tr-cache-cleared'));
-        document.dispatchEvent(new CustomEvent('ds-tr-cache-cleared'));
-      }
-    } catch {
-      setStatus('清除失败');
-    } finally {
-      if (btn) btn.disabled = false;
-      await refreshCacheStats();
-    }
-  }
-
-  async function refreshCacheStats() {
-    const el = document.getElementById('ds-tr-cache-stats');
-    if (!el) return;
-    try {
-      const raw: any = await (backend as any).getCacheStats();
-      const res = (typeof raw === 'string' ? JSON.parse(raw) : raw) as { ok?: boolean; entries?: number; bytes?: number };
-      if (!res?.ok) { el.textContent = '缓存：读取失败'; return; }
-      const kb = (res.bytes || 0) / 1024;
-      const size = kb >= 1024 ? (kb / 1024).toFixed(2) + ' MB' : kb.toFixed(1) + ' KB';
-      el.textContent = '缓存：' + (res.entries || 0).toLocaleString() + ' 条 / ' + size;
-    } catch {
-      el.textContent = '缓存：读取失败';
-    }
+    settings.openPanel();
   }
 
 
@@ -293,5 +188,5 @@ export function menuUI(document: Document) {
     dialog.showModal();
   }
 
-  return { ensureStyle, buildMenu, openPanel, showFailure, field, setStatus };
+  return { ensureStyle, buildMenu, openPanel, closePanel: settings.closePanel, showFailure, field: (id: string) => document.getElementById(id) as HTMLInputElement | null, setStatus: settings.setStatus };
 }

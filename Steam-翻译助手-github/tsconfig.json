@@ -11,6 +11,7 @@
     "noImplicitReturns": true,
     "noImplicitThis": true,
     "noImplicitAny": true,
+    "strictNullChecks": true,
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
@@ -26,7 +27,9 @@
     }
   },
   "include": [
-    "frontend/library.tsx", "webview/**/*.ts",
+    "frontend/library.tsx",
+    "webview/**/*.ts",
+    "shared/**/*.ts",
     ".millennium/**/*.d.ts"
   ]
 }
